@@ -29,6 +29,7 @@ You can tune the build with following CMake options:
 - `Ymir_ENABLE_TESTS` (`BOOL`): Includes the unit test project in the build. Enabled by default if this is the top level CMake project.
 - `Ymir_ENABLE_SANDBOX` (`BOOL`): Includes the sandbox project in the build. Enabled by default if this is the top level CMake project.
 - `Ymir_ENABLE_YMDASM` (`BOOL`): Includes the disassembly tool project in the build. Enabled by default if this is the top level CMake project.
+- `Ymir_ENABLE_LIBRETRO` (`BOOL`): Includes the libretro core target (`ymir_libretro`). Enabled by default if this is the top level CMake project.
 - `Ymir_ENABLE_IPO` (`BOOL`): Enables interprocedural optimizations (also called link-time optimizations) on all projects. Enabled by default.
 - `Ymir_ENABLE_DEVLOG` (`BOOL`): Enables logs meant to aid development. Enabled by default.
 - `Ymir_ENABLE_IMGUI_DEMO` (`BOOL`): Enables the ImGui demo window, useful as a reference when developing new UI elements. Enabled by default.
@@ -151,6 +152,22 @@ You can use CMake to build the project, regardless of generator:
 cmake --build build --parallel
 ```
 
+
+## Building the libretro core
+
+The libretro target is included when `Ymir_ENABLE_LIBRETRO` is enabled (default for top-level builds). Configure the
+build normally and then build the `ymir-libretro` target:
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --target ymir-libretro --parallel
+```
+
+The resulting core is placed at `build/apps/ymir-libretro/ymir_libretro.<dll|so|dylib>`.
+
+Place a 512 KiB Sega Saturn BIOS (IPL) in RetroArch's system directory. The core auto-detects the first matching
+512 KiB file in `system/ymir/roms/ipl`, `system/roms/ipl` or directly under `system/`. Internal backup RAM and SMPC
+settings are persisted to the frontend's save directory (falling back to the system directory when unavailable).
 
 After building, you will find the .app bundle at:
 ```sh

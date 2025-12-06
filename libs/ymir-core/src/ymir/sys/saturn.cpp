@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <cassert>
+#include <stdexcept>
 
 namespace ymir {
 
@@ -390,28 +391,42 @@ void Saturn::EnableDebugTracing(bool enable) {
 }
 
 void Saturn::SaveState(state::State &state) const {
-    m_scheduler.SaveState(state.scheduler);
-    m_system.SaveState(state.system);
-    mem.SaveState(state.system);
+    auto save_section = [](std::string_view label, auto &&fn) {
+        try {
+            devlog::info<grp::system>("savestate enter {}", label);
+            fn();
+            devlog::info<grp::system>("savestate exit {}", label);
+        } catch (const std::exception &e) {
+            devlog::error<grp::system>("savestate {} exception {}", label, e.what());
+            throw std::runtime_error(std::string(label) + ": " + e.what());
+        } catch (...) {
+            devlog::error<grp::system>("savestate {} unknown exception", label);
+            throw std::runtime_error(std::string(label) + ": unknown exception");
+        }
+    };
+
+    save_section("scheduler", [&] { m_scheduler.SaveState(state.scheduler); });
+    save_section("system", [&] { m_system.SaveState(state.system); });
+    save_section("memory", [&] { mem.SaveState(state.system); });
     state.system.slaveSH2Enabled = slaveSH2Enabled;
     state.msh2SpilloverCycles = m_msh2SpilloverCycles;
     state.ssh2SpilloverCycles = m_ssh2SpilloverCycles;
-    masterSH2.SaveState(state.msh2);
-    slaveSH2.SaveState(state.ssh2);
-    SCU.SaveState(state.scu);
-    SMPC.SaveState(state.smpc);
-    VDP.SaveState(state.vdp);
-    SCSP.SaveState(state.scsp);
+    save_section("msh2", [&] { masterSH2.SaveState(state.msh2); });
+    save_section("ssh2", [&] { slaveSH2.SaveState(state.ssh2); });
+    save_section("scu", [&] { SCU.SaveState(state.scu); });
+    save_section("smpc", [&] { SMPC.SaveState(state.smpc); });
+    save_section("vdp", [&] { VDP.SaveState(state.vdp); });
+    save_section("scsp", [&] { SCSP.SaveState(state.scsp); });
     state.cdblockLLE = m_cdblockLLE;
     if (m_cdblockLLE) {
-        SH1.SaveState(state.sh1);
-        YGR.SaveState(state.ygr);
-        CDDrive.SaveState(state.cddrive);
+        save_section("sh1", [&] { SH1.SaveState(state.sh1); });
+        save_section("ygr", [&] { YGR.SaveState(state.ygr); });
+        save_section("cddrive", [&] { CDDrive.SaveState(state.cddrive); });
         state.cdblockDRAM = CDBlockDRAM;
         state.sh1SpilloverCycles = m_sh1SpilloverCycles;
         state.sh1FracCycles = m_sh1FracCycles;
     } else {
-        CDBlock.SaveState(state.cdblock);
+        save_section("cdblock", [&] { CDBlock.SaveState(state.cdblock); });
     }
     state.discHash = GetDiscHash();
 }

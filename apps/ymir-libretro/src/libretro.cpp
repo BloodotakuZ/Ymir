@@ -10,10 +10,6 @@
 #include <ymir/hw/smpc/peripheral/peripheral_port.hpp>
 #include <ymir/hw/vdp/vdp_defs.hpp>
 
-#include <serdes/state_cereal.hpp>
-
-#include <cereal/archives/portable_binary.hpp>
-
 #include <fmt/format.h>
 
 #include <algorithm>
@@ -21,14 +17,23 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
+#include <cstdio>
+#include <type_traits>
+
+#if defined(_WIN32)
+    #include <windows.h>
+    #include <eh.h>
+#endif
 
 namespace {
 
@@ -41,7 +46,7 @@ struct InputContext {
 };
 
 struct LibretroContext {
-    retro_environment_t environ = nullptr;
+    retro_environment_t env_cb = nullptr;
     retro_video_refresh_t video_cb = nullptr;
     retro_audio_sample_t audio_cb = nullptr;
     retro_audio_sample_batch_t audio_batch_cb = nullptr;
@@ -71,46 +76,115 @@ LibretroContext g_ctx{};
 
 constexpr unsigned kAudioSampleRate = 44100;
 
+std::mutex g_logMtx;
+
+constexpr size_t kRollbackStateSize = sizeof(ymir::state::State);
+static_assert(std::is_trivially_copyable_v<ymir::state::State>,
+              "RollbackState must be trivially copyable for memcpy-based snapshots");
+
+std::filesystem::path GetFallbackLogPath() {
+#if defined(_WIN32)
+    HMODULE hm = nullptr;
+    char modulePath[MAX_PATH]{};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&GetFallbackLogPath), &hm)) {
+        if (GetModuleFileNameA(hm, modulePath, static_cast<DWORD>(std::size(modulePath))) > 0) {
+            std::filesystem::path p{modulePath};
+            // Place log next to the core DLL.
+            return p.parent_path() / "ymir_libretro.log";
+        }
+    }
+#endif
+    // Fallback to working directory.
+    return std::filesystem::current_path() / "ymir_libretro.log";
+}
+
+std::filesystem::path GetSaveLogPath() {
+    auto base = GetFallbackLogPath();
+    return base.parent_path() / "ymir_libretro_savestate.log";
+}
+
+void AppendFallbackLog(std::string_view line) {
+    std::lock_guard lock{g_logMtx};
+    static const auto logPath = GetFallbackLogPath();
+    std::ofstream out{logPath, std::ios::app};
+    if (out) {
+        out << line << '\n';
+        out.flush();
+    }
+}
+
+void AppendSaveLog(std::string_view line) {
+    std::lock_guard lock{g_logMtx};
+    static const auto logPath = GetSaveLogPath();
+    std::ofstream out{logPath, std::ios::app};
+    if (out) {
+        out << line << '\n';
+        out.flush();
+    }
+}
+
+#if defined(_WIN32)
+void SEHTranslator(unsigned int code, EXCEPTION_POINTERS * /*info*/) {
+    // Translate Windows SEH to C++ exceptions so we can log them.
+    throw std::runtime_error(fmt::format("Structured exception 0x{:X}", code));
+}
+#endif
+
 void RefreshLogInterface() {
     g_ctx.log_cb = nullptr;
-    if (g_ctx.environ == nullptr) {
+    if (g_ctx.env_cb == nullptr) {
         return;
     }
 
     retro_log_callback callback{};
-    if (g_ctx.environ(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &callback) && callback.log != nullptr) {
+    if (g_ctx.env_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &callback) && callback.log != nullptr) {
         g_ctx.log_cb = callback.log;
     }
 }
 
 void Log(retro_log_level level, std::string_view message) {
+    const auto formatted = fmt::format("[Ymir] {}", message);
+    AppendFallbackLog(formatted);
     if (g_ctx.log_cb != nullptr) {
         g_ctx.log_cb(level, "%s", std::string(message).c_str());
+    } else {
+        fmt::print(stderr, "{}\n", formatted);
+#if defined(_WIN32)
+        OutputDebugStringA(formatted.c_str());
+        OutputDebugStringA("\n");
+#endif
     }
 }
 
 template <typename... Args>
 void LogFmt(retro_log_level level, fmt::format_string<Args...> fmtStr, Args &&...args) {
+    const auto formatted = fmt::format(fmtStr, std::forward<Args>(args)...);
+    AppendFallbackLog("[Ymir] " + formatted);
     if (g_ctx.log_cb != nullptr) {
-        const auto formatted = fmt::format(fmtStr, std::forward<Args>(args)...);
         g_ctx.log_cb(level, "%s", formatted.c_str());
+    } else {
+        fmt::print(stderr, "[Ymir] {}\n", formatted);
+#if defined(_WIN32)
+        OutputDebugStringA(("[Ymir] " + formatted + "\n").c_str());
+#endif
     }
 }
 
 void DisplayFrontendMessage(std::string_view message) {
-    if (g_ctx.environ == nullptr) {
+    if (g_ctx.env_cb == nullptr) {
         return;
     }
     retro_message msg{message.data(), 360};
-    g_ctx.environ(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+    g_ctx.env_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
 }
 
 std::optional<std::filesystem::path> QueryPath(unsigned cmd) {
-    if (g_ctx.environ == nullptr) {
+    if (g_ctx.env_cb == nullptr) {
         return std::nullopt;
     }
     const char *dir = nullptr;
-    if (g_ctx.environ(cmd, &dir) && dir != nullptr) {
+    if (g_ctx.env_cb(cmd, &dir) && dir != nullptr) {
         return std::filesystem::path{dir};
     }
     return std::nullopt;
@@ -148,12 +222,13 @@ std::optional<std::filesystem::path> FindIPLROM(const std::filesystem::path &sys
         if (!std::filesystem::is_directory(root, ec)) {
             continue;
         }
-        for (const auto &entry : std::filesystem::directory_iterator(root, ec)) {
-            if (ec || !entry.is_regular_file()) {
+        for (std::filesystem::recursive_directory_iterator it{root, ec}, end; it != end && !ec; ++it) {
+            if (!it->is_regular_file()) {
                 continue;
             }
-            if (entry.file_size() == ymir::sys::kIPLSize) {
-                return entry.path();
+            if (it->file_size() == ymir::sys::kIPLSize) {
+                LogFmt(RETRO_LOG_INFO, "Ymir: Found BIOS candidate '{}'", it->path().string());
+                return it->path();
             }
         }
     }
@@ -163,8 +238,11 @@ std::optional<std::filesystem::path> FindIPLROM(const std::filesystem::path &sys
 bool LoadIPLROM(ymir::Saturn &saturn) {
     const auto path = FindIPLROM(g_ctx.system_dir);
     if (!path) {
-        Log(RETRO_LOG_ERROR, "Ymir: Could not locate a 512 KiB Saturn BIOS (IPL) in the system directory");
-        DisplayFrontendMessage("Ymir: missing BIOS file (copy a 512 KiB Saturn IPL to the system directory)");
+        Log(RETRO_LOG_ERROR,
+            "Ymir: Could not locate a 512 KiB Saturn BIOS (IPL). Add a 512 KiB BIOS under system/ymir/roms/ipl, "
+            "system/roms/ipl, or system/.");
+        DisplayFrontendMessage(
+            "Ymir core: missing BIOS. Place a 512 KiB Saturn IPL under system/ymir/roms/ipl or system/roms/ipl.");
         return false;
     }
 
@@ -221,6 +299,7 @@ bool LoadDisc(ymir::Saturn &saturn, const std::filesystem::path &path) {
         });
     if (!ok) {
         LogFmt(RETRO_LOG_ERROR, "Ymir: Failed to load disc '{}'", path.string());
+        DisplayFrontendMessage("Ymir core: failed to load disc (see log)");
         return false;
     }
 
@@ -305,7 +384,7 @@ void ConfigureOptions(ymir::Saturn &saturn) {
 }
 
 void SendInputDescriptors() {
-    if (g_ctx.environ == nullptr) {
+    if (g_ctx.env_cb == nullptr) {
         return;
     }
 
@@ -339,16 +418,16 @@ void SendInputDescriptors() {
         {0, RETRO_DEVICE_NONE, 0, 0, nullptr},
     };
 
-    g_ctx.environ(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)descriptors);
+    g_ctx.env_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void *)descriptors);
 }
 
 void SendControllerInfo() {
-    if (g_ctx.environ == nullptr) {
+    if (g_ctx.env_cb == nullptr) {
         return;
     }
     static const retro_controller_description pads[] = {{"Sega Saturn Control Pad", RETRO_DEVICE_JOYPAD}};
     static const retro_controller_info ports[] = {{pads, 1}, {pads, 1}, {nullptr, 0}};
-    g_ctx.environ(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
+    g_ctx.env_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void *)ports);
 }
 
 retro_system_av_info BuildAVInfo() {
@@ -370,19 +449,24 @@ bool SerializeToBuffer(std::vector<uint8_t> &out) {
         return false;
     }
     try {
+        AppendSaveLog("[savestate] SerializeToBuffer enter (rollback)");
+        Log(RETRO_LOG_INFO, "Ymir: SerializeToBuffer entering (rollback blob)");
         ymir::state::State state{};
         g_ctx.saturn->SaveState(state);
-
-        std::ostringstream stream(std::ios::binary);
-        cereal::PortableBinaryOutputArchive archive{stream};
-        archive(state);
-        const auto str = stream.str();
-        out.assign(str.begin(), str.end());
+        out.resize(kRollbackStateSize);
+        std::memcpy(out.data(), &state, kRollbackStateSize);
+        LogFmt(RETRO_LOG_INFO, "Ymir: SerializeToBuffer serialized {} bytes (rollback)", out.size());
+        AppendSaveLog(fmt::format("[savestate] SerializeToBuffer done size={} (rollback)", out.size()));
         return true;
     } catch (const std::exception &e) {
         LogFmt(RETRO_LOG_ERROR, "Ymir: Failed to serialize state: {}", e.what());
+        AppendSaveLog(std::string("[savestate] SerializeToBuffer exception: ") + e.what());
         return false;
     }
+}
+
+bool SerializeToBufferSafe(std::vector<uint8_t> &out) {
+    return SerializeToBuffer(out);
 }
 
 bool DeserializeFromBuffer(const void *data, size_t size) {
@@ -390,11 +474,14 @@ bool DeserializeFromBuffer(const void *data, size_t size) {
         return false;
     }
     try {
-        std::string buffer(static_cast<const char *>(data), static_cast<const char *>(data) + size);
-        std::istringstream stream(buffer, std::ios::binary);
-        cereal::PortableBinaryInputArchive archive{stream};
+        if (size < kRollbackStateSize) {
+            AppendSaveLog(fmt::format("[savestate] DeserializeFromBuffer too small {} < {}", size, kRollbackStateSize));
+            LogFmt(RETRO_LOG_ERROR, "Ymir: DeserializeFromBuffer too small {} < {}", size, kRollbackStateSize);
+            return false;
+        }
+
         ymir::state::State state{};
-        archive(state);
+        std::memcpy(&state, data, kRollbackStateSize);
         if (!g_ctx.saturn->LoadState(state, false)) {
             Log(RETRO_LOG_ERROR, "Ymir: Save state does not match the currently loaded disc or BIOS");
             return false;
@@ -404,6 +491,10 @@ bool DeserializeFromBuffer(const void *data, size_t size) {
         LogFmt(RETRO_LOG_ERROR, "Ymir: Failed to load save state: {}", e.what());
         return false;
     }
+}
+
+bool DeserializeFromBufferSafe(const void *data, size_t size) {
+    return DeserializeFromBuffer(data, size);
 }
 
 void FlushPersistentData() {
@@ -423,11 +514,13 @@ void FlushPersistentData() {
 extern "C" {
 
 RETRO_API unsigned retro_api_version() {
+    Log(RETRO_LOG_INFO, "Ymir: retro_api_version");
     return RETRO_API_VERSION;
 }
 
 RETRO_API void retro_set_environment(retro_environment_t cb) {
-    g_ctx.environ = cb;
+    g_ctx.env_cb = cb;
+    Log(RETRO_LOG_INFO, "Ymir: retro_set_environment");
     RefreshLogInterface();
     SendControllerInfo();
 }
@@ -453,10 +546,14 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb) {
 }
 
 RETRO_API void retro_init() {
+    Log(RETRO_LOG_INFO, "Ymir: retro_init");
+#if defined(_WIN32)
+    _set_se_translator(SEHTranslator);
+#endif
     RefreshLogInterface();
-    if (g_ctx.environ != nullptr) {
+    if (g_ctx.env_cb != nullptr) {
         bool noGame = false;
-        g_ctx.environ(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &noGame);
+        g_ctx.env_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &noGame);
     }
 }
 
@@ -468,9 +565,11 @@ RETRO_API void retro_get_system_info(retro_system_info *info) {
     if (info == nullptr) {
         return;
     }
+    Log(RETRO_LOG_INFO, "Ymir: retro_get_system_info");
     info->library_name = "Ymir";
     info->library_version = ymir::version::string;
-    info->valid_extensions = "chd|cue|iso|mds|ccd";
+    // Accept common Saturn disc image formats; bin/img allow BIN/CUE and CCD/IMG/SUB sets.
+    info->valid_extensions = "chd|cue|iso|mds|ccd|bin|img";
     info->need_fullpath = true;
     info->block_extract = true;
 }
@@ -479,12 +578,14 @@ RETRO_API void retro_get_system_av_info(retro_system_av_info *info) {
     if (info == nullptr) {
         return;
     }
+    Log(RETRO_LOG_INFO, "Ymir: retro_get_system_av_info");
     *info = BuildAVInfo();
 }
 
 RETRO_API void retro_set_controller_port_device(unsigned /*port*/, unsigned /*device*/) {}
 
 RETRO_API void retro_reset() {
+    Log(RETRO_LOG_INFO, "Ymir: retro_reset");
     if (g_ctx.saturn) {
         g_ctx.saturn->Reset(true);
         g_ctx.frame_ready = false;
@@ -493,6 +594,7 @@ RETRO_API void retro_reset() {
 }
 
 RETRO_API void retro_run() {
+    Log(RETRO_LOG_INFO, "Ymir: retro_run");
     if (!g_ctx.saturn) {
         return;
     }
@@ -536,33 +638,72 @@ RETRO_API void retro_run() {
 }
 
 RETRO_API size_t retro_serialize_size() {
-    std::vector<uint8_t> buffer{};
-    if (SerializeToBuffer(buffer)) {
-        return buffer.size();
-    }
-    return 0;
+    LogFmt(RETRO_LOG_INFO, "Ymir: retro_serialize_size -> {}", kRollbackStateSize);
+    AppendSaveLog(fmt::format("[savestate] retro_serialize_size -> {} (rollback fixed size)", kRollbackStateSize));
+    return kRollbackStateSize;
 }
 
 RETRO_API bool retro_serialize(void *data, size_t size) {
-    std::vector<uint8_t> buffer{};
-    if (!SerializeToBuffer(buffer) || buffer.size() > size) {
-        return false;
+    try {
+        LogFmt(RETRO_LOG_INFO, "Ymir: retro_serialize requested size {}", size);
+        AppendSaveLog(fmt::format("[savestate] retro_serialize requested size {}", size));
+        if (size < kRollbackStateSize) {
+            LogFmt(RETRO_LOG_ERROR, "Ymir: retro_serialize buffer too small (need {}, have {})", kRollbackStateSize, size);
+            AppendSaveLog(fmt::format("[savestate] retro_serialize buffer too small need {} have {}", kRollbackStateSize, size));
+            return false;
+        }
+        std::vector<uint8_t> buffer{};
+        if (!SerializeToBufferSafe(buffer)) {
+            return false;
+        }
+        if (buffer.size() != kRollbackStateSize) {
+            LogFmt(RETRO_LOG_WARN, "Ymir: retro_serialize unexpected blob size {} (expected {})", buffer.size(), kRollbackStateSize);
+        }
+        std::memcpy(data, buffer.data(), kRollbackStateSize);
+        LogFmt(RETRO_LOG_INFO, "Ymir: retro_serialize wrote {} bytes (rollback)", kRollbackStateSize);
+        AppendSaveLog(fmt::format("[savestate] retro_serialize wrote {} bytes (rollback)", kRollbackStateSize));
+        return true;
+    } catch (const std::exception &e) {
+        LogFmt(RETRO_LOG_ERROR, "Ymir: retro_serialize failed: {}", e.what());
+        AppendSaveLog(std::string("[savestate] retro_serialize exception: ") + e.what());
+    } catch (...) {
+        Log(RETRO_LOG_ERROR, "Ymir: retro_serialize failed with unknown error");
+        AppendSaveLog("[savestate] retro_serialize exception: unknown");
     }
-    std::memcpy(data, buffer.data(), buffer.size());
-    return true;
+    return false;
 }
 
 RETRO_API bool retro_unserialize(const void *data, size_t size) {
-    return DeserializeFromBuffer(data, size);
+    try {
+        LogFmt(RETRO_LOG_INFO, "Ymir: retro_unserialize size {}", size);
+        AppendSaveLog(fmt::format("[savestate] retro_unserialize size {}", size));
+        if (size < kRollbackStateSize) {
+            LogFmt(RETRO_LOG_ERROR, "Ymir: retro_unserialize buffer too small (need {}, have {})", kRollbackStateSize, size);
+            AppendSaveLog(fmt::format("[savestate] retro_unserialize buffer too small need {} have {}", kRollbackStateSize, size));
+            return false;
+        }
+        return DeserializeFromBufferSafe(data, size);
+    } catch (const std::exception &e) {
+        LogFmt(RETRO_LOG_ERROR, "Ymir: retro_unserialize failed: {}", e.what());
+        AppendSaveLog(std::string("[savestate] retro_unserialize exception: ") + e.what());
+    } catch (...) {
+        Log(RETRO_LOG_ERROR, "Ymir: retro_unserialize failed with unknown error");
+        AppendSaveLog("[savestate] retro_unserialize exception: unknown");
+    }
+    return false;
 }
 
 RETRO_API bool retro_load_game(const retro_game_info *game) {
+    Log(RETRO_LOG_INFO, "Ymir: retro_load_game entered");
     if (game == nullptr || game->path == nullptr) {
+        Log(RETRO_LOG_ERROR, "Ymir: retro_load_game called with null game or path");
         return false;
     }
 
     g_ctx.system_dir = QueryPath(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY).value_or(std::filesystem::current_path());
     g_ctx.save_dir = DetermineSavePath();
+    LogFmt(RETRO_LOG_INFO, "Ymir: System dir '{}', Save dir '{}', Loading '{}'", g_ctx.system_dir.string(),
+           g_ctx.save_dir.string(), game->path);
 
     g_ctx.saturn = std::make_unique<ymir::Saturn>();
     ConfigureOptions(*g_ctx.saturn);
@@ -571,10 +712,10 @@ RETRO_API bool retro_load_game(const retro_game_info *game) {
     SendInputDescriptors();
 
     retro_pixel_format pixelFormat = RETRO_PIXEL_FORMAT_XRGB8888;
-    if (g_ctx.environ != nullptr) {
-        g_ctx.environ(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixelFormat);
+    if (g_ctx.env_cb != nullptr) {
+        g_ctx.env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixelFormat);
         auto av = BuildAVInfo();
-        g_ctx.environ(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+        g_ctx.env_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
     }
 
     g_ctx.framebuffer_xbgr.resize(ymir::vdp::kMaxResH * ymir::vdp::kMaxResV);
@@ -584,6 +725,7 @@ RETRO_API bool retro_load_game(const retro_game_info *game) {
     g_ctx.audio_buffer.clear();
 
     if (!LoadIPLROM(*g_ctx.saturn)) {
+        Log(RETRO_LOG_ERROR, "Ymir: Failed to load BIOS (place a 512 KiB Saturn IPL in the system directory)");
         return false;
     }
 
@@ -592,9 +734,11 @@ RETRO_API bool retro_load_game(const retro_game_info *game) {
     }
 
     if (!LoadDisc(*g_ctx.saturn, std::filesystem::path{game->path})) {
+        LogFmt(RETRO_LOG_ERROR, "Ymir: Failed to load disc '{}'", game->path);
         return false;
     }
 
+    Log(RETRO_LOG_INFO, "Ymir: Game loaded successfully");
     return true;
 }
 

@@ -1,0 +1,24 @@
+# Minimal makefile to configure and build only the libretro core.
+# Usage (from repo root, inside a Visual Studio Native Tools prompt):
+#   make -f Makefile.libretro
+# You can override CONFIG or BUILD_DIR:
+#   make -f Makefile.libretro CONFIG=Debug
+
+BUILD_DIR ?= build-release
+CONFIG ?= Release
+GENERATOR ?= Ninja
+
+.PHONY: all configure build clean rebuild
+
+all: build
+
+configure:
+	cmake -S . -B $(BUILD_DIR) -G "$(GENERATOR)" -DCMAKE_BUILD_TYPE=$(CONFIG)
+
+build: configure
+	cmake --build $(BUILD_DIR) --target ymir-libretro --config $(CONFIG)
+
+clean:
+	-cmake --build $(BUILD_DIR) --target clean --config $(CONFIG)
+
+rebuild: clean build

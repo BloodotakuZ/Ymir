@@ -38,3 +38,14 @@ detect_arch_symbol("__x86_64__" x86_64) # Clang/GCC
 detect_arch_symbol("__x86_64" x86_64) # Clang/GCC
 detect_arch_symbol("_M_AMD64" x86_64) # MSVC
 detect_arch_symbol("_M_X64" x86_64) # MSVC
+
+# Fallback: use the configured system processor if no compiler macro was detected.
+if (NOT DEFINED ARCHITECTURES)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _ymir_sys_proc)
+    if (_ymir_sys_proc STREQUAL "amd64" OR _ymir_sys_proc STREQUAL "x86_64")
+        set(ARCHITECTURES "x86_64")
+    elseif (_ymir_sys_proc STREQUAL "arm64" OR _ymir_sys_proc STREQUAL "aarch64")
+        set(ARCHITECTURES "arm64")
+    endif ()
+    unset(_ymir_sys_proc)
+endif ()

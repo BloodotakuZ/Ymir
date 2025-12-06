@@ -1,0 +1,14 @@
+display_name = "Ymir (Sega Saturn)"
+corename = "Ymir"
+systemname = "Sega Saturn"
+manufacturer = "Sega"
+categories = "Emulator"
+license = "GPLv3"
+authors = "Ymir Team"
+supported_extensions = "chd|cue|iso|mds|ccd|bin|img"
+database = "Sega - Saturn"
+firmware_count = 1
+firmware0_desc = "Sega Saturn BIOS (512 KiB, any region)"
+firmware0_path = "ymir/roms/ipl/saturn_ipl.bin"
+firmware0_opt = false
+notes = "Place the BIOS under system/ymir/roms/ipl or system/roms/ipl (rename to saturn_ipl.bin to satisfy the firmware check). The core requires full disc images (CHD/CUE/ISO/MDS/CCD/BIN/IMG)."

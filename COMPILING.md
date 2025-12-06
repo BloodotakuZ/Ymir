@@ -166,8 +166,14 @@ cmake --build build --target ymir-libretro --parallel
 The resulting core is placed at `build/apps/ymir-libretro/ymir_libretro.<dll|so|dylib>`.
 
 Place a 512 KiB Sega Saturn BIOS (IPL) in RetroArch's system directory. The core auto-detects the first matching
-512 KiB file in `system/ymir/roms/ipl`, `system/roms/ipl` or directly under `system/`. Internal backup RAM and SMPC
-settings are persisted to the frontend's save directory (falling back to the system directory when unavailable).
+512 KiB file in `system/ymir/roms/ipl`, `system/roms/ipl` or directly under `system/`. To satisfy RetroArch's firmware
+check from the `.info` file below, name it `saturn_ipl.bin` and place it under `system/ymir/roms/ipl/`. Internal backup
+RAM and SMPC settings are persisted to the frontend's save directory (falling back to the system directory when
+unavailable).
+
+To make the core show compatible content in RetroArch's file browser, copy `apps/ymir-libretro/ymir_libretro.info`
+into RetroArch's `info/` directory next to the core DLL/so/dylib. The `.info` file declares the supported disc
+extensions (`chd|cue|iso|mds|ccd|bin|img`) and the BIOS requirement noted above.
 
 After building, you will find the .app bundle at:
 ```sh
